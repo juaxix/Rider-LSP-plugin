@@ -1,0 +1,28 @@
+<idea-plugin>
+    <id>com.jxapps.riderlsp</id>
+    <name>Rider LSP Server</name>
+    <version>1.0.0</version>
+    <vendor>JxApps</vendor>
+
+    <description><![CDATA[
+        Exposes Rider's C++ intellisense as a TCP-based LSP server.
+        Allows external LSP clients to query navigation, completion, hover, diagnostics, and symbol search.
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>com.intellij.modules.lang</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <postStartupActivity
+            implementation="com.jxapps.riderlsp.RiderLspStartupActivity" />
+
+        <applicationService
+            serviceImplementation="com.jxapps.riderlsp.LspSettings" />
+
+        <applicationConfigurable
+            parentId="tools"
+            instance="com.jxapps.riderlsp.LspSettingsConfigurable"
+            id="com.jxapps.riderlsp.LspSettingsConfigurable"
+            displayName="Rider LSP Server" />
+    </extensions>
+</idea-plugin>
