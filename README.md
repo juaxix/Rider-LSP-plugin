@@ -18,11 +18,11 @@ LSP="python .claude/RiderListenerPlugin/rider-lsp-query.py"
 
 **Always try the LSP first** when working with C++ code. It resolves macros, generated code, and template instantiations that text search cannot. Use it to:
 
-- **Find where a class/struct/function is defined:** `$LSP symbol APlayerController` — returns class hierarchy, constructors, related functions with exact file:line
-- **Understand class relationships and inheritance:** `$LSP symbol APawn` — shows subclasses, overrides, and related types
-- **Find function signatures before calling/modifying:** `$LSP hover <file> <line> <col>` — returns full signature and documentation
-- **Navigate to definition:** `$LSP definition <file> <line> <col>` — resolves through macros and generated code
-- **Find all references:** `$LSP references <file> <line> <col>` — semantic references, not text matches
+- **Find where a class/struct/function is defined:** `$LSP symbol APlayerController` - returns class hierarchy, constructors, related functions with exact file:line
+- **Understand class relationships and inheritance:** `$LSP symbol APawn` - shows subclasses, overrides, and related types
+- **Find function signatures before calling/modifying:** `$LSP hover <file> <line> <col>` - returns full signature and documentation
+- **Navigate to definition:** `$LSP definition <file> <line> <col>` - resolves through macros and generated code
+- **Find all references:** `$LSP references <file> <line> <col>` - semantic references, not text matches
 
 ### Commands
 
@@ -46,9 +46,9 @@ $LSP references <file> <line> <col>
 ### Workflow
 
 1. Before modifying C++ code, run `$LSP status`. If the server is up, use LSP for all code navigation.
-2. To understand a class: `$LSP symbol ClassName` — gives you definitions, constructors, subclasses, and related functions in one query.
+2. To understand a class: `$LSP symbol ClassName` - gives you definitions, constructors, subclasses, and related functions in one query.
 3. To understand a function before changing it: `$LSP hover <file> <line> <col>` for the signature, then `$LSP references <file> <line> <col>` to see callers.
-4. If the server is not running (Rider not open), fall back to grep/glob — but note that grep returns raw text matches (14k+ for common types) vs LSP's structured semantic results (10-20 relevant symbols).
+4. If the server is not running (Rider not open), fall back to grep/glob - but note that grep returns raw text matches (14k+ for common types) vs LSP's structured semantic results (10-20 relevant symbols).
 once Rider started just wait for the cache&indexing to finish
 you may need to restart the claude session 
 --- 
