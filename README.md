@@ -4,6 +4,9 @@ Includes a python script to use with Claude Code or any other LLM console comman
 
 Build plugin with `gradlew.bat buildPlugin`, install it in Rider 2026.1+ , open the project wait for the cache to finish and be ready. Place the python script in your .claude and add instructions in your CLAUDE.MD (or turn it to a SKILL). 
 
+**Results**:
+![Diff](https://raw.githubusercontent.com/juaxix/Rider-LSP-plugin/refs/heads/main/Diff.jpg)
+
 Instructions:
 ---
 ## Rider LSP Intellisense
