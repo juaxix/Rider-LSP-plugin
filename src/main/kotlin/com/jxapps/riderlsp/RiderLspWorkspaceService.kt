@@ -168,9 +168,10 @@ class RiderLspWorkspaceService(
                     }
                 }, EmptyProgressIndicator())
 
-                val names = when (result) {
-                    is Collection<*> -> result.filterIsInstance<String>()
-                    is Array<*> -> result.filterIsInstance<String>()
+                val snapshot = result
+                val names: List<String> = when (snapshot) {
+                    is Collection<*> -> snapshot.filterIsInstance<String>()
+                    is Array<*> -> snapshot.filterIsInstance<String>()
                     else -> emptyList()
                 }
 
