@@ -5,9 +5,12 @@ import com.intellij.navigation.ChooseByNameContributor
 import com.intellij.navigation.ChooseByNameContributorEx
 import com.intellij.navigation.NavigationItem
 import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.application.ReadAction
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.fileEditor.FileDocumentManager
 import com.intellij.openapi.vfs.VirtualFile
+import com.intellij.openapi.progress.EmptyProgressIndicator
+import com.intellij.openapi.progress.ProgressManager
 import com.intellij.openapi.project.DumbService
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
@@ -154,11 +157,15 @@ class RiderLspWorkspaceService(
             if (requestNamesMethod != null) {
                 log.info("  Calling requestNamesBlockingAndCacheGotoResults('$query', false)...")
 
-                val result = when (requestNamesMethod.parameterCount) {
-                    2 -> requestNamesMethod.invoke(session, query, true)
-                    1 -> requestNamesMethod.invoke(session, query)
-                    else -> null
-                }
+                // This method internally calls runBlockingCancellable which requires
+                // a ProgressIndicator or coroutine Job in the thread context.
+                val result = ProgressManager.getInstance().runProcess(com.intellij.openapi.util.ThrowableComputable {
+                    when (requestNamesMethod.parameterCount) {
+                        2 -> requestNamesMethod.invoke(session, query, true)
+                        1 -> requestNamesMethod.invoke(session, query)
+                        else -> null
+                    }
+                }, EmptyProgressIndicator())
 
                 val names = when (result) {
                     is Collection<*> -> result.filterIsInstance<String>()
@@ -175,15 +182,19 @@ class RiderLspWorkspaceService(
 
                 if (processMethod != null) {
                     log.info("  Using processBoundItemsWithNavItemsCacheLock to resolve items")
-                    for (name in names) {
-                        if (symbols.size >= maxResults) break
-                        try {
-                            processMethod.invoke(session, project, name, Processor<NavigationItem> { navItem ->
-                                addNavigationItem(navItem, name, symbols, seen)
-                                symbols.size < maxResults
-                            })
-                        } catch (e: Exception) {
-                            log.debug("  processBoundItems failed for '$name': ${e.message}")
+                    // processBoundItemsWithNavItemsCacheLock resolves cached items into
+                    // PsiFile/NavigationItem objects, which requires read access.
+                    ReadAction.run<Exception> {
+                        for (name in names) {
+                            if (symbols.size >= maxResults) break
+                            try {
+                                processMethod.invoke(session, project, name, Processor<NavigationItem> { navItem ->
+                                    addNavigationItem(navItem, name, symbols, seen)
+                                    symbols.size < maxResults
+                                })
+                            } catch (e: Exception) {
+                                log.debug("  processBoundItems failed for '$name': ${e.message}")
+                            }
                         }
                     }
                     log.info("  After processBoundItems: ${symbols.size} symbols")
@@ -283,29 +294,33 @@ class RiderLspWorkspaceService(
                 log.info("  Trying $label ChooseByNameContributorEx: ${contributor.javaClass.name}")
 
                 try {
-                    val matchedNames = mutableListOf<String>()
+                    // processNames and processElementsWithName access stub indices
+                    // and PSI, which require read access.
+                    ReadAction.run<Exception> {
+                        val matchedNames = mutableListOf<String>()
 
-                    contributor.processNames(Processor { name ->
-                        if (name.contains(query, ignoreCase = true)) {
-                            matchedNames.add(name)
-                        }
-                        matchedNames.size < maxResults
-                    }, scope, idFilter)
-
-                    log.info("    processNames found ${matchedNames.size} matching names")
-
-                    val findParams = FindSymbolParameters(query, query, scope, null)
-                    for (name in matchedNames) {
-                        if (symbols.size >= maxResults) break
-                        contributor.processElementsWithName(name, Processor { element ->
-                            if (element is NavigationItem) {
-                                addNavigationItem(element, name, symbols, seen)
+                        contributor.processNames(Processor { name ->
+                            if (name.contains(query, ignoreCase = true)) {
+                                matchedNames.add(name)
                             }
-                            symbols.size < maxResults
-                        }, findParams)
-                    }
+                            matchedNames.size < maxResults
+                        }, scope, idFilter)
 
-                    log.info("    After processElements: ${symbols.size} symbols total")
+                        log.info("    processNames found ${matchedNames.size} matching names")
+
+                        val findParams = FindSymbolParameters(query, query, scope, null)
+                        for (name in matchedNames) {
+                            if (symbols.size >= maxResults) break
+                            contributor.processElementsWithName(name, Processor { element ->
+                                if (element is NavigationItem) {
+                                    addNavigationItem(element, name, symbols, seen)
+                                }
+                                symbols.size < maxResults
+                            }, findParams)
+                        }
+
+                        log.info("    After processElements: ${symbols.size} symbols total")
+                    }
                 } catch (e: Exception) {
                     log.warn("    ContributorEx failed: ${e.javaClass.simpleName}: ${e.message}")
                 }
