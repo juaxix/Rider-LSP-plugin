@@ -159,8 +159,9 @@ class RiderLspWorkspaceService(
 
                 // This method internally calls runBlockingCancellable which requires
                 // a ProgressIndicator or coroutine Job in the thread context.
-                val result = ProgressManager.getInstance().runProcess(com.intellij.openapi.util.ThrowableComputable {
-                    when (requestNamesMethod.parameterCount) {
+                var result: Any? = null
+                ProgressManager.getInstance().runProcess(Runnable {
+                    result = when (requestNamesMethod.parameterCount) {
                         2 -> requestNamesMethod.invoke(session, query, true)
                         1 -> requestNamesMethod.invoke(session, query)
                         else -> null
