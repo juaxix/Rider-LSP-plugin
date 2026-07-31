@@ -13,6 +13,8 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 
 class RiderLspStartupActivity : ProjectActivity {
 
@@ -54,9 +56,19 @@ class LspServerManager(
     fun start() {
         executor.submit {
             try {
-                val bindAddress = InetAddress.getByName("127.0.0.1")
-                serverSocket = ServerSocket(port, 1, bindAddress)
-                log.info("Rider LSP server listening on 127.0.0.1:$port")
+                val bindAddressStr = LspSettings.getInstance().bindAddress
+                val bindAddress = try {
+                    InetAddress.getByName(bindAddressStr)
+                } catch (e: Exception) {
+                    log.warn("Invalid bind address: $bindAddressStr, falling back to 127.0.0.1")
+                    InetAddress.getByName("127.0.0.1")
+                }
+
+                // Set SO_REUSEADDR to allow quick restart
+                serverSocket = ServerSocket(port, 50, bindAddress).apply {
+                    reuseAddress = true
+                }
+                log.info("Rider LSP server listening on $bindAddressStr:$port")
 
                 while (running) {
                     acceptClient()
@@ -71,7 +83,22 @@ class LspServerManager(
 
     private fun acceptClient() {
         val socket = try {
-            serverSocket?.accept() ?: return
+            val ss = serverSocket
+            if (ss == null) {
+                log.warn("ServerSocket is null, skipping accept")
+                return
+            }
+
+            // Set timeout to allow checking 'running' flag periodically
+            ss.soTimeout = 5000
+            ss.accept()
+        } catch (e: java.net.SocketTimeoutException) {
+            // Timeout is expected, allows checking running flag
+            return
+        } catch (e: java.net.SocketException) {
+            // Socket closed or other error
+            if (running) log.info("Socket exception during accept: ${e.message}")
+            return
         } catch (e: Exception) {
             if (running) log.warn("Accept failed", e)
             return
@@ -96,7 +123,12 @@ class LspServerManager(
             )
             server.connect(launcher.remoteProxy)
             activeLauncher = launcher.startListening()
-            activeLauncher?.get() // blocks until client disconnects
+            // Wait with timeout to prevent indefinite blocking
+            try {
+                activeLauncher?.get(30, TimeUnit.SECONDS)
+            } catch (e: TimeoutException) {
+                log.info("LSP client timeout after 30 seconds")
+            }
         } catch (e: Exception) {
             if (running) log.info("LSP client disconnected: ${e.message}")
         } finally {
@@ -104,6 +136,7 @@ class LspServerManager(
         }
     }
 
+    @Synchronized
     private fun disconnectActiveClient() {
         try {
             activeLauncher?.cancel(true)
@@ -122,7 +155,21 @@ class LspServerManager(
         } catch (_: Exception) {
         }
         serverSocket = null
-        executor.shutdownNow()
+
+        // Properly shutdown executor
+        executor.shutdown()
+        try {
+            if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
+                log.warn("Executor did not terminate within 5 seconds, forcing shutdown")
+                executor.shutdownNow()
+                executor.awaitTermination(2, TimeUnit.SECONDS)
+            }
+        } catch (e: InterruptedException) {
+            log.warn("Interrupted while waiting for executor termination")
+            executor.shutdownNow()
+            Thread.currentThread().interrupt()
+        }
+
         log.info("Rider LSP server stopped")
     }
 }

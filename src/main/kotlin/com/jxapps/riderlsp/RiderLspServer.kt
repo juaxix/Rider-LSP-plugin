@@ -17,21 +17,26 @@ class RiderLspServer(
     @Volatile
     private var client: LanguageClient? = null
 
-    private val textDocumentService = RiderLspTextDocumentService(project, this)
-    private val workspaceService = RiderLspWorkspaceService(project)
+    @Volatile
     private var diagnosticsPublisher: DiagnosticsPublisher? = null
 
+    private val textDocumentService = RiderLspTextDocumentService(project, this)
+    private val workspaceService = RiderLspWorkspaceService(project)
+
     override fun connect(client: LanguageClient?) {
-        if (client != null) {
-            this.client = client
-            diagnosticsPublisher = DiagnosticsPublisher(project, client)
-        }
+        require(client != null) { "Client must not be null" }
+        this.client = client
+        diagnosticsPublisher = DiagnosticsPublisher(project, client)
+        log.info("LSP client connected and diagnostics publisher initialized")
     }
 
     fun getClient(): LanguageClient? = client
 
     override fun initialize(params: InitializeParams): CompletableFuture<InitializeResult> {
         log.info("LSP initialize from: ${params.clientInfo?.name ?: "unknown"}")
+
+        // Ensure client is connected before proceeding
+        require(client != null) { "connect() must be called before initialize()" }
 
         val capabilities = ServerCapabilities().apply {
             setTextDocumentSync(TextDocumentSyncOptions().apply {
@@ -63,12 +68,21 @@ class RiderLspServer(
 
     override fun initialized(params: InitializedParams) {
         log.info("LSP client initialized")
-        diagnosticsPublisher?.start()
+        val publisher = diagnosticsPublisher
+        if (publisher != null) {
+            publisher.start()
+        } else {
+            log.error("DiagnosticsPublisher not initialized - connect() may not have been called")
+        }
     }
 
     override fun shutdown(): CompletableFuture<Any> {
         log.info("LSP shutdown requested")
-        diagnosticsPublisher?.stop()
+        try {
+            diagnosticsPublisher?.stop()
+        } catch (e: Exception) {
+            log.warn("Error stopping diagnostics publisher", e)
+        }
         return CompletableFuture.completedFuture(null)
     }
 

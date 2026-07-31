@@ -58,10 +58,57 @@ class LspSettingsConfigurable : Configurable {
     }
 
     override fun apply() {
+        val portText = portField?.text?.trim() ?: "9999"
+        val port = portText.toIntOrNull()
+
+        // Validate port range
+        if (port == null || port !in 1..65535) {
+            JOptionPane.showMessageDialog(
+                panel,
+                "Invalid port: '$portText'. Port must be a number between 1 and 65535.",
+                "Invalid Port",
+                JOptionPane.ERROR_MESSAGE
+            )
+            return
+        }
+
+        // Validate bind address (basic check)
+        val bindAddress = bindField?.text?.trim() ?: "127.0.0.1"
+        if (bindAddress.isBlank()) {
+            JOptionPane.showMessageDialog(
+                panel,
+                "Bind address cannot be empty.",
+                "Invalid Bind Address",
+                JOptionPane.ERROR_MESSAGE
+            )
+            return
+        }
+
+        // Try to parse bind address as IP or hostname
+        try {
+            java.net.InetAddress.getByName(bindAddress)
+        } catch (e: Exception) {
+            JOptionPane.showMessageDialog(
+                panel,
+                "Invalid bind address: '$bindAddress'. Must be a valid IP address or hostname.",
+                "Invalid Bind Address",
+                JOptionPane.ERROR_MESSAGE
+            )
+            return
+        }
+
+        // All validation passed, apply settings
         val settings = LspSettings.getInstance()
         settings.enabled = enabledCheckbox?.isSelected ?: true
-        settings.port = portField?.text?.toIntOrNull() ?: 9999
-        settings.bindAddress = bindField?.text ?: "127.0.0.1"
+        settings.port = port
+        settings.bindAddress = bindAddress
+
+        JOptionPane.showMessageDialog(
+            panel,
+            "Settings saved. IDE restart required for changes to take effect.",
+            "Settings Applied",
+            JOptionPane.INFORMATION_MESSAGE
+        )
     }
 
     override fun reset() {

@@ -20,6 +20,7 @@ import org.eclipse.lsp4j.CompletionItemLabelDetails
 import org.eclipse.lsp4j.Position
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 
 @Suppress("UnstableApiUsage")
 object CompletionBridge {
@@ -36,39 +37,43 @@ object CompletionBridge {
 
             val latch = CountDownLatch(1)
 
-            ApplicationManager.getApplication().invokeAndWait {
-                try {
-                    val psiFile = PsiManager.getInstance(project).findFile(virtualFile) ?: run {
-                        latch.countDown()
-                        return@invokeAndWait
-                    }
-
-                    val editor = EditorFactory.getInstance().createEditor(document, project)
+            try {
+                ApplicationManager.getApplication().invokeAndWait {
                     try {
-                        editor.caretModel.moveToOffset(offset)
-
-                        val psiElement = psiFile.findElementAt(offset)
-                            ?: psiFile.findElementAt(offset - 1)
-
-                        if (psiElement != null) {
-                            val params = createCompletionParameters(
-                                psiFile, psiElement, offset, editor
-                            )
-                            if (params != null) {
-                                performCompletion(params, items)
-                            }
+                        val psiFile = PsiManager.getInstance(project).findFile(virtualFile) ?: run {
+                            return@invokeAndWait
                         }
-                    } finally {
-                        EditorFactory.getInstance().releaseEditor(editor)
-                    }
-                } catch (e: Exception) {
-                    log.debug("Completion error: ${e.message}")
-                } finally {
-                    latch.countDown()
-                }
-            }
 
-            latch.await(10, TimeUnit.SECONDS)
+                        val editor = EditorFactory.getInstance().createEditor(document, project)
+                        try {
+                            editor.caretModel.moveToOffset(offset)
+
+                            val psiElement = psiFile.findElementAt(offset)
+                                ?: psiFile.findElementAt(offset - 1)
+
+                            if (psiElement != null) {
+                                val params = createCompletionParameters(
+                                    psiFile, psiElement, offset, editor
+                                )
+                                if (params != null) {
+                                    performCompletion(params, items)
+                                }
+                            }
+                        } finally {
+                            EditorFactory.getInstance().releaseEditor(editor)
+                        }
+                    } catch (e: Exception) {
+                        log.debug("Completion error: ${e.message}")
+                    } finally {
+                        latch.countDown()
+                    }
+                }
+
+                // Always ensure latch is decremented (handles invokeAndWait exception case)
+                latch.await(10, TimeUnit.SECONDS)
+            } catch (e: TimeoutException) {
+                log.warn("Completion request timed out after 10 seconds")
+            }
         } catch (e: Exception) {
             log.warn("CompletionBridge error", e)
         }

@@ -91,12 +91,17 @@ class RiderLspTextDocumentService(
     override fun typeDefinition(params: TypeDefinitionParams): CompletableFuture<Either<List<Location>, List<LocationLink>>> {
         return computeInSmartMode("typeDefinition") {
             val locations = mutableListOf<Location>()
-            val element = findElementAt(params.textDocument.uri, params.position)
-            val named = PsiTreeUtil.getParentOfType(element, PsiNamedElement::class.java)
-            if (named != null) {
-                // Try to resolve the type of the element
-                LspTranslator.psiElementToLocation(named)?.let { locations.add(it) }
+
+            // Try to resolve reference first
+            val ref = findReferenceAt(params.textDocument.uri, params.position)
+            val element = ref?.resolve() ?: findElementAt(params.textDocument.uri, params.position)
+
+            if (element != null) {
+                // For variables/fields, try to find their type
+                // For methods/functions, try to find return type's definition
+                LspTranslator.psiElementToLocation(element)?.let { locations.add(it) }
             }
+
             Either.forLeft(locations)
         }
     }
@@ -142,10 +147,9 @@ class RiderLspTextDocumentService(
 
             if (named != null) {
                 val docComment = findDocComment(named)
-                val signature = named.text?.let { text ->
-                    // Take first few lines as signature
-                    text.lines().take(5).joinToString("\n")
-                } ?: named.name ?: ""
+
+                // Better signature extraction
+                val signature = extractSignature(named)
 
                 val markdown = buildString {
                     append("```cpp\n")
@@ -161,6 +165,29 @@ class RiderLspTextDocumentService(
             } else {
                 Hover(MarkupContent("markdown", ""))
             }
+        }
+    }
+
+    private fun extractSignature(element: PsiNamedElement): String {
+        return try {
+            // For better signature extraction, get the element's name and context
+            val name = element.name ?: "unknown"
+
+            // Try to build a meaningful signature
+            val text = element.text ?: ""
+            val lines = text.lines()
+
+            // Find the line with the actual signature (often first non-comment line)
+            var signature = if (lines.isNotEmpty()) lines[0] else text
+
+            // Limit length to avoid excessive output
+            if (signature.length > 200) {
+                signature = signature.substring(0, 200) + "..."
+            }
+
+            signature
+        } catch (e: Exception) {
+            element.name ?: "unknown"
         }
     }
 

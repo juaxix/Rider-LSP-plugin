@@ -25,7 +25,13 @@ class DiagnosticsPublisher(
     @Volatile
     private var connection: com.intellij.util.messages.MessageBusConnection? = null
 
+    @Synchronized
     fun start() {
+        if (connection != null) {
+            log.warn("DiagnosticsPublisher already started")
+            return
+        }
+
         val bus = project.messageBus.connect()
         connection = bus
 
@@ -38,9 +44,15 @@ class DiagnosticsPublisher(
         log.info("DiagnosticsPublisher started")
     }
 
+    @Synchronized
     fun stop() {
-        connection?.disconnect()
-        connection = null
+        try {
+            connection?.disconnect()
+        } catch (e: Exception) {
+            log.warn("Error disconnecting message bus", e)
+        } finally {
+            connection = null
+        }
         log.info("DiagnosticsPublisher stopped")
     }
 
