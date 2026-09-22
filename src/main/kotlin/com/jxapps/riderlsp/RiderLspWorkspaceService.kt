@@ -4,22 +4,21 @@ package com.jxapps.riderlsp
 import com.intellij.navigation.ChooseByNameContributor
 import com.intellij.navigation.ChooseByNameContributorEx
 import com.intellij.navigation.NavigationItem
+import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
-import com.intellij.openapi.application.ReadAction
+import com.intellij.openapi.application.runReadAction
 import com.intellij.openapi.diagnostic.Logger
-import com.intellij.openapi.fileEditor.FileDocumentManager
-import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.openapi.progress.EmptyProgressIndicator
 import com.intellij.openapi.progress.ProgressManager
-import com.intellij.openapi.project.DumbService
 import com.intellij.openapi.project.Project
-import com.intellij.openapi.util.Disposer
+import com.intellij.openapi.util.text.StringUtil
+import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.psi.PsiElement
 import com.intellij.psi.PsiNamedElement
 import com.intellij.psi.search.FilenameIndex
 import com.intellij.psi.search.GlobalSearchScope
-import com.intellij.psi.PsiFile
 import com.intellij.psi.search.PsiSearchHelper
+import com.intellij.psi.search.UsageSearchContext
 import com.intellij.util.Processor
 import com.intellij.util.indexing.FindSymbolParameters
 import com.intellij.util.indexing.IdFilter
@@ -27,18 +26,35 @@ import org.eclipse.lsp4j.*
 import org.eclipse.lsp4j.jsonrpc.messages.Either
 import org.eclipse.lsp4j.services.WorkspaceService
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
+/**
+ * `workspace/symbol` for one client session.
+ *
+ * Rider's C++ symbol index lives in the ReSharper backend and is reached through its
+ * "goto" sessions. Those sessions are bound to [sessionDisposable]: they are shared for the
+ * lifetime of the client connection (so repeated queries stay fast) and released the moment
+ * the connection ends. Binding them to the project, as older versions did, kept every
+ * result cache alive until the project closed.
+ */
 class RiderLspWorkspaceService(
-    private val project: Project
+    private val project: Project,
+    private val sessionDisposable: Disposable
 ) : WorkspaceService {
 
     private val log = Logger.getInstance(RiderLspWorkspaceService::class.java)
     private val maxResults = 100
 
-    // Cache goto sessions so the backend index survives across queries
-    private val cachedSessions = mutableMapOf<String, Any>()
-    private val sessionDisposables = mutableMapOf<String, com.intellij.openapi.Disposable>()
+    private val cachedSessions = ConcurrentHashMap<String, Any>()
+
+    @Volatile
+    private var disposed = false
+
+    fun dispose() {
+        disposed = true
+        cachedSessions.clear()
+    }
 
     override fun symbol(params: WorkspaceSymbolParams): CompletableFuture<Either<List<SymbolInformation>, List<WorkspaceSymbol>>> {
         val query = params.query
@@ -48,11 +64,11 @@ class RiderLspWorkspaceService(
 
         val future = CompletableFuture<Either<List<SymbolInformation>, List<WorkspaceSymbol>>>()
 
-        // RD protocol calls MUST NOT run inside ReadAction — they call back to the backend
+        // RD protocol calls MUST NOT run inside a ReadAction: they call back into the backend
         // and can deadlock if the read lock is held. Run on a pooled thread instead.
-        com.intellij.openapi.application.ApplicationManager.getApplication().executeOnPooledThread {
+        ApplicationManager.getApplication().executeOnPooledThread {
             try {
-                val results = collectSymbols(query)
+                val results = collectSymbols(query.trim())
                 log.info("workspace/symbol query='$query' returned ${results.size} results")
                 future.complete(Either.forLeft(results))
             } catch (e: Exception) {
@@ -68,26 +84,28 @@ class RiderLspWorkspaceService(
         val symbols = mutableListOf<SymbolInformation>()
         val seen = mutableSetOf<String>()
 
-        // Strategy 1: Use RdDotnetGotoService with correct GotoKindEnumKey
+        // Strategy 1: Rider backend goto sessions (types first, then all symbols)
         collectViaRdDotnetService(query, "GotoType", symbols, seen)
         if (symbols.size < maxResults) {
             collectViaRdDotnetService(query, "GotoSymbol", symbols, seen)
         }
 
-        // Strategy 2: Use ChooseByNameContributorEx — always run to catch Engine symbols
-        // that the RD backend may not return (e.g. AActor, FJsonValue, UWorld)
+        // Strategy 2: ChooseByNameContributorEx, catches symbols the backend session did not return
         if (symbols.size < maxResults) {
             collectViaProtocolContributorEx(query, symbols, seen)
         }
 
-        // Strategy 3: File-based search — find class/struct declarations directly in headers.
-        // Catches Engine types (AActor, FJsonValue, UWorld) that the RD backend doesn't index.
-        if (symbols.size < maxResults && !symbols.any { it.name == query }) {
+        // Strategy 3: header text search for class/struct declarations (engine types outside the index)
+        if (symbols.size < maxResults && symbols.none { it.name == query }) {
             collectViaFileSearch(query, symbols, seen)
         }
 
         return symbols
     }
+
+    // ------------------------------------------------------------------------------------------
+    // Strategy 1: RdDotnetGotoService (reflection, degrades gracefully when Rider internals change)
+    // ------------------------------------------------------------------------------------------
 
     private fun collectViaRdDotnetService(
         query: String,
@@ -95,128 +113,101 @@ class RiderLspWorkspaceService(
         symbols: MutableList<SymbolInformation>,
         seen: MutableSet<String>
     ) {
-        try {
-            // Get the service
-            val serviceClass = Class.forName("com.jetbrains.rider.globalNavigation.RdDotnetGotoService")
-            val companion = serviceClass.getDeclaredField("Companion").get(null)
-            val getInstanceMethod = companion.javaClass.methods.find { m ->
-                m.name == "getInstance" && m.parameterCount == 1
-            } ?: return
-            val service = getInstanceMethod.invoke(companion, project) ?: return
+        if (disposed || project.isDisposed) return
 
-            // Create GotoKindEnumKey(GotoKind.GotoType) or GotoKindEnumKey(GotoKind.GotoSymbol)
+        try {
+            val serviceClass = Class.forName("com.jetbrains.rider.globalNavigation.RdDotnetGotoService")
+            val service = serviceClass.methods
+                .firstOrNull { it.name == "getInstance" && it.parameterCount == 1 && java.lang.reflect.Modifier.isStatic(it.modifiers) }
+                ?.invoke(null, project)
+                ?: run {
+                    val companion = serviceClass.getDeclaredField("Companion").get(null)
+                    companion.javaClass.methods.firstOrNull { it.name == "getInstance" && it.parameterCount == 1 }
+                        ?.invoke(companion, project)
+                }
+                ?: return
+
             val gotoKindClass = Class.forName("com.jetbrains.rd.ide.model.GotoKind")
             val gotoKind = gotoKindClass.getDeclaredField(kindName).get(null)
 
             val gotoKindEnumKeyClass = Class.forName("com.jetbrains.rd.ide.model.GotoKindEnumKey")
-            val enumKeyCtor = gotoKindEnumKeyClass.declaredConstructors.find { c ->
+            val enumKeyCtor = gotoKindEnumKeyClass.declaredConstructors.firstOrNull { c ->
                 c.parameterCount == 1 && c.parameterTypes[0].name.contains("GotoKind")
-            }
-            if (enumKeyCtor == null) {
-                log.info("  GotoKindEnumKey(GotoKind) constructor not found")
+            } ?: run {
+                log.debug("GotoKindEnumKey(GotoKind) constructor not found")
                 return
             }
             enumKeyCtor.isAccessible = true
             val gotoKey = enumKeyCtor.newInstance(gotoKind)
 
-            log.info("  Created GotoKindEnumKey($kindName)")
-
-            // Reuse cached session so the backend index survives across queries
+            // getOrBindGotoSession(disposable, key): the disposable is a "ticket" that keeps the backend
+            // session alive. Using the client session's disposable means the backend releases it when
+            // the client disconnects.
             val session = cachedSessions.getOrPut(kindName) {
-                val disposable = Disposer.newDisposable("LspGoto-$kindName")
-                Disposer.register(project as com.intellij.openapi.Disposable, disposable)
-                sessionDisposables[kindName] = disposable
-
-                val getSessionMethod = service.javaClass.methods.find { m ->
+                val getSessionMethod = service.javaClass.methods.firstOrNull { m ->
                     m.name == "getOrBindGotoSession" && m.parameterCount == 2
                 } ?: run {
-                    log.info("  getOrBindGotoSession not found")
-                    Disposer.dispose(disposable)
-                    sessionDisposables.remove(kindName)
+                    log.debug("getOrBindGotoSession not found")
                     return
                 }
-
-                val s = getSessionMethod.invoke(service, disposable, gotoKey)
-                if (s == null) {
-                    log.info("  getOrBindGotoSession returned null")
-                    Disposer.dispose(disposable)
-                    sessionDisposables.remove(kindName)
+                if (disposed) return
+                getSessionMethod.invoke(service, sessionDisposable, gotoKey) ?: run {
+                    log.debug("getOrBindGotoSession returned null")
                     return
                 }
-                log.info("  Created and cached session: ${s.javaClass.name}")
-                s
             }
 
-            log.info("  Using session: ${session.javaClass.name}")
-
-            // requestNamesBlockingAndCacheGotoResults — blocks until backend responds
-            val requestNamesMethod = session.javaClass.methods.find { m ->
+            val requestNamesMethod = session.javaClass.methods.firstOrNull { m ->
                 m.name == "requestNamesBlockingAndCacheGotoResults"
+            } ?: return
+
+            // Internally uses runBlockingCancellable, which needs a progress indicator in context.
+            var result: Any? = null
+            ProgressManager.getInstance().runProcess({
+                result = when (requestNamesMethod.parameterCount) {
+                    2 -> requestNamesMethod.invoke(session, query, true)
+                    1 -> requestNamesMethod.invoke(session, query)
+                    else -> null
+                }
+            }, EmptyProgressIndicator())
+
+            val names: List<String> = when (val snapshot = result) {
+                is Collection<*> -> snapshot.filterIsInstance<String>()
+                is Array<*> -> snapshot.filterIsInstance<String>()
+                else -> emptyList()
+            }
+            log.debug("$kindName: ${names.size} names for '$query'")
+
+            val processMethod = session.javaClass.methods.firstOrNull { m ->
+                m.name == "processBoundItemsWithNavItemsCacheLock"
             }
 
-            if (requestNamesMethod != null) {
-                log.info("  Calling requestNamesBlockingAndCacheGotoResults('$query', false)...")
-
-                // This method internally calls runBlockingCancellable which requires
-                // a ProgressIndicator or coroutine Job in the thread context.
-                var result: Any? = null
-                ProgressManager.getInstance().runProcess(Runnable {
-                    result = when (requestNamesMethod.parameterCount) {
-                        2 -> requestNamesMethod.invoke(session, query, true)
-                        1 -> requestNamesMethod.invoke(session, query)
-                        else -> null
-                    }
-                }, EmptyProgressIndicator())
-
-                val snapshot = result
-                val names: List<String> = when (snapshot) {
-                    is Collection<*> -> snapshot.filterIsInstance<String>()
-                    is Array<*> -> snapshot.filterIsInstance<String>()
-                    else -> emptyList()
-                }
-
-                log.info("  Got ${names.size} names from requestNames")
-
-                // Use processBoundItemsWithNavItemsCacheLock to get NavigationItems
-                val processMethod = session.javaClass.methods.find { m ->
-                    m.name == "processBoundItemsWithNavItemsCacheLock"
-                }
-
-                if (processMethod != null) {
-                    log.info("  Using processBoundItemsWithNavItemsCacheLock to resolve items")
-                    // processBoundItemsWithNavItemsCacheLock resolves cached items into
-                    // PsiFile/NavigationItem objects, which requires read access.
-                    ReadAction.run<Exception> {
-                        for (name in names) {
-                            if (symbols.size >= maxResults) break
-                            try {
-                                processMethod.invoke(session, project, name, Processor<NavigationItem> { navItem ->
-                                    addNavigationItem(navItem, name, symbols, seen)
-                                    symbols.size < maxResults
-                                })
-                            } catch (e: Exception) {
-                                log.debug("  processBoundItems failed for '$name': ${e.message}")
-                            }
-                        }
-                    }
-                    log.info("  After processBoundItems: ${symbols.size} symbols")
-                } else {
-                    log.info("  processBoundItemsWithNavItemsCacheLock not found, falling back to getItemsByShortName")
+            if (processMethod != null) {
+                // Resolving cached items into NavigationItems needs read access.
+                runReadAction {
                     for (name in names) {
                         if (symbols.size >= maxResults) break
-                        getItemsByShortName(session, name, symbols, seen)
+                        try {
+                            processMethod.invoke(session, project, name, Processor<NavigationItem> { navItem ->
+                                addNavigationItem(navItem, name, symbols, seen)
+                                symbols.size < maxResults
+                            })
+                        } catch (e: Exception) {
+                            log.debug("processBoundItems failed for '$name': ${e.message}")
+                        }
                     }
                 }
+            } else {
+                for (name in names) {
+                    if (symbols.size >= maxResults) break
+                    getItemsByShortName(session, name, symbols, seen)
+                }
             }
-
-            // Sessions are cached — disposal happens when the project closes
         } catch (e: ClassNotFoundException) {
-            log.info("  Class not found: ${e.message}")
+            log.debug("Rider goto service not available in this build: ${e.message}")
         } catch (e: Exception) {
-            log.warn("  RdDotnetService search ($kindName) failed: ${e.javaClass.simpleName}: ${e.message}")
-            if (e.cause != null) {
-                log.warn("    Cause: ${e.cause?.javaClass?.simpleName}: ${e.cause?.message}")
-            }
+            log.warn("RdDotnetGotoService search ($kindName) failed: ${e.javaClass.simpleName}: ${e.message}")
+            e.cause?.let { log.warn("  Cause: ${it.javaClass.simpleName}: ${it.message}") }
         }
     }
 
@@ -227,7 +218,7 @@ class RiderLspWorkspaceService(
         seen: MutableSet<String>
     ) {
         try {
-            val method = session.javaClass.methods.find { m ->
+            val method = session.javaClass.methods.firstOrNull { m ->
                 m.name == "getItemsByShortName" && m.parameterCount == 1
             } ?: return
 
@@ -235,70 +226,37 @@ class RiderLspWorkspaceService(
             if (items is List<*>) {
                 for (item in items) {
                     if (symbols.size >= maxResults) break
-                    when (item) {
-                        is NavigationItem -> addNavigationItem(item, name, symbols, seen)
-                        null -> {}
-                        else -> addRdGotoResult(item, name, symbols, seen)
+                    if (item is NavigationItem) {
+                        addNavigationItem(item, name, symbols, seen)
                     }
                 }
             }
         } catch (e: Exception) {
-            log.debug("  getItemsByShortName('$name') failed: ${e.message}")
+            log.debug("getItemsByShortName('$name') failed: ${e.message}")
         }
     }
 
-    private fun addRdGotoResult(
-        result: Any,
-        fallbackName: String,
-        symbols: MutableList<SymbolInformation>,
-        seen: MutableSet<String>
-    ) {
-        try {
-            val resultClass = result.javaClass
-            // Log all getters on first encounter
-            log.info("    RdGotoResult type: ${resultClass.name}")
-            val getters = resultClass.methods.filter {
-                it.name.startsWith("get") && it.parameterCount == 0 && it.returnType != Void.TYPE
-            }
-            for (g in getters) {
-                try {
-                    val value = g.invoke(result)
-                    val valueStr = value?.toString()?.take(100) ?: "null"
-                    log.info("      ${g.name}() -> $valueStr")
-                } catch (_: Exception) {}
-            }
-        } catch (e: Exception) {
-            log.debug("    addRdGotoResult failed: ${e.message}")
-        }
-    }
+    // ------------------------------------------------------------------------------------------
+    // Strategy 2: ChooseByNameContributorEx
+    // ------------------------------------------------------------------------------------------
 
     private fun collectViaProtocolContributorEx(
         query: String,
         symbols: MutableList<SymbolInformation>,
         seen: MutableSet<String>
     ) {
-        // Use allScope to include Engine/library symbols, not just project source
         val scope = GlobalSearchScope.allScope(project)
-        val idFilter: IdFilter? = null  // No filter — include all indexed files
+        val idFilter: IdFilter? = null
 
-        // Try both CLASS and SYMBOL extension points
-        for ((epName, label) in listOf(
-            ChooseByNameContributor.CLASS_EP_NAME to "CLASS",
-            ChooseByNameContributor.SYMBOL_EP_NAME to "SYMBOL"
-        )) {
+        for (epName in listOf(ChooseByNameContributor.CLASS_EP_NAME, ChooseByNameContributor.SYMBOL_EP_NAME)) {
             if (symbols.size >= maxResults) break
-            val contributors = epName.extensionList
 
-            for (contributor in contributors) {
+            for (contributor in epName.extensionList) {
                 if (symbols.size >= maxResults) break
                 if (contributor !is ChooseByNameContributorEx) continue
 
-                log.info("  Trying $label ChooseByNameContributorEx: ${contributor.javaClass.name}")
-
                 try {
-                    // processNames and processElementsWithName access stub indices
-                    // and PSI, which require read access.
-                    ReadAction.run<Exception> {
+                    runReadAction {
                         val matchedNames = mutableListOf<String>()
 
                         contributor.processNames(Processor { name ->
@@ -308,9 +266,7 @@ class RiderLspWorkspaceService(
                             matchedNames.size < maxResults
                         }, scope, idFilter)
 
-                        log.info("    processNames found ${matchedNames.size} matching names")
-
-                        val findParams = FindSymbolParameters(query, query, scope, null)
+                        val findParams = FindSymbolParameters.wrap(query, scope)
                         for (name in matchedNames) {
                             if (symbols.size >= maxResults) break
                             contributor.processElementsWithName(name, Processor { element ->
@@ -320,20 +276,21 @@ class RiderLspWorkspaceService(
                                 symbols.size < maxResults
                             }, findParams)
                         }
-
-                        log.info("    After processElements: ${symbols.size} symbols total")
                     }
                 } catch (e: Exception) {
-                    log.warn("    ContributorEx failed: ${e.javaClass.simpleName}: ${e.message}")
+                    log.debug("ContributorEx ${contributor.javaClass.simpleName} failed: ${e.javaClass.simpleName}: ${e.message}")
                 }
             }
         }
     }
 
+    // ------------------------------------------------------------------------------------------
+    // Strategy 3: header text search
+    // ------------------------------------------------------------------------------------------
+
     /**
-     * Strategy 3: File-based search for class/struct declarations in header files.
-     * Uses FilenameIndex (UE naming conventions) and PsiSearchHelper (word index)
-     * to find Engine types that the RD backend doesn't expose via GotoType/GotoSymbol.
+     * Finds class/struct declarations in header files by text. Uses FilenameIndex (UE naming
+     * conventions) and the word index; reads file text without creating Documents.
      */
     private fun collectViaFileSearch(
         query: String,
@@ -342,92 +299,66 @@ class RiderLspWorkspaceService(
     ) {
         if (query.length < 2 || query.contains(" ")) return
 
-        log.info("  Strategy 3: File-based search for '$query'")
-
         try {
-            val found = ApplicationManager.getApplication().runReadAction(
-                com.intellij.openapi.util.ThrowableComputable<List<SymbolInformation>, Exception> {
-                    val results = mutableListOf<SymbolInformation>()
-                    val localSeen = mutableSetOf<String>()
-                    localSeen.addAll(seen)
-                    val scope = GlobalSearchScope.allScope(project)
+            val found = runReadAction {
+                val results = mutableListOf<SymbolInformation>()
+                val localSeen = mutableSetOf<String>().apply { addAll(seen) }
+                val scope = GlobalSearchScope.allScope(project)
 
-                    // Step 1: Derive possible header filenames from UE naming conventions.
-                    // AActor -> Actor.h, FJsonValue -> JsonValue.h, UWorld -> World.h, etc.
-                    val possibleNames = mutableListOf("$query.h")
-                    if (query.length > 1 && query[0] in "AUFESIT" && query[1].isUpperCase()) {
-                        possibleNames.add(0, "${query.substring(1)}.h")
-                    }
-
-                    log.info("    Step 1: Searching for files named: $possibleNames")
-                    for (fileName in possibleNames) {
-                        if (results.size >= maxResults) break
-                        val files = FilenameIndex.getVirtualFilesByName(fileName, scope)
-                        for (file in files) {
-                            if (results.size >= maxResults) break
-                            searchFileForDeclaration(file, query, results, localSeen)
-                        }
-                    }
-
-                    // Step 2: If no exact match found via filename, use PsiSearchHelper's
-                    // word index to efficiently find header files containing the query word.
-                    if (results.isEmpty()) {
-                        log.info("    Step 2: Using PsiSearchHelper word index for '$query'")
-                        try {
-                            var scanned = 0
-                            PsiSearchHelper.getInstance(project).processAllFilesWithWord(
-                                query,
-                                scope,
-                                Processor<PsiFile> { psiFile ->
-                                    val vf = psiFile.virtualFile
-                                    if (vf != null && (vf.extension == "h" || vf.extension == "hpp") && scanned < 50) {
-                                        scanned++
-                                        searchFileForDeclaration(vf, query, results, localSeen)
-                                    }
-                                    results.size < maxResults
-                                },
-                                true
-                            )
-                            log.info("    Step 2 scanned $scanned header files, found ${results.size} results")
-                        } catch (e: Exception) {
-                            log.info("    Step 2 PsiSearchHelper failed: ${e.javaClass.simpleName}: ${e.message}")
-                            // Fallback: scan FilenameIndex
-                            try {
-                                val allHeaders = FilenameIndex.getAllFilesByExt(project, "h", scope)
-                                val queryLower = query.lowercase()
-                                var scanned = 0
-                                for (file in allHeaders) {
-                                    if (results.size >= maxResults || scanned >= 20) break
-                                    if (file.nameWithoutExtension.lowercase().contains(queryLower)) {
-                                        scanned++
-                                        searchFileForDeclaration(file, query, results, localSeen)
-                                    }
-                                }
-                                log.info("    Step 2 fallback scanned $scanned files, found ${results.size} results")
-                            } catch (e2: Exception) {
-                                log.info("    Step 2 fallback also failed: ${e2.message}")
-                            }
-                        }
-                    }
-
-                    log.info("    Strategy 3 found ${results.size} declarations")
-                    results
+                // Step 1: UE naming conventions: AActor -> Actor.h, FJsonValue -> JsonValue.h, UWorld -> World.h
+                val possibleNames = mutableListOf("$query.h")
+                if (query.length > 1 && query[0] in "AUFESIT" && query[1].isUpperCase()) {
+                    possibleNames.add(0, "${query.substring(1)}.h")
                 }
-            )
 
-            symbols.addAll(found)
+                for (fileName in possibleNames) {
+                    if (results.size >= maxResults) break
+                    for (file in FilenameIndex.getVirtualFilesByName(fileName, scope)) {
+                        if (results.size >= maxResults) break
+                        searchFileForDeclaration(file, query, results, localSeen)
+                    }
+                }
+
+                // Step 2: word index -> candidate header files (VirtualFiles only, no PSI, no Documents)
+                if (results.isEmpty()) {
+                    try {
+                        var scanned = 0
+                        PsiSearchHelper.getInstance(project).processCandidateFilesForText(
+                            scope,
+                            UsageSearchContext.IN_CODE,
+                            true,
+                            query,
+                            Processor<VirtualFile> { vf ->
+                                val ext = vf.extension
+                                if ((ext == "h" || ext == "hpp" || ext == "hxx") && scanned < MAX_HEADERS_TO_SCAN) {
+                                    scanned++
+                                    searchFileForDeclaration(vf, query, results, localSeen)
+                                }
+                                results.size < maxResults && scanned < MAX_HEADERS_TO_SCAN
+                            }
+                        )
+                        log.debug("Header search scanned $scanned files, found ${results.size} results")
+                    } catch (e: Exception) {
+                        log.debug("Word-index header search failed: ${e.javaClass.simpleName}: ${e.message}")
+                    }
+                }
+
+                results
+            }
+
             for (sym in found) {
-                seen.add("${sym.name}@${sym.location.uri}:${sym.location.range.start.line}")
+                val key = "${sym.name}@${sym.location.uri}:${sym.location.range.start.line}"
+                if (seen.add(key)) symbols.add(sym)
             }
         } catch (e: Exception) {
-            log.warn("  Strategy 3 failed: ${e.javaClass.simpleName}: ${e.message}")
+            log.warn("Header search failed: ${e.javaClass.simpleName}: ${e.message}")
         }
     }
 
     /**
-     * Search a single header file for class/struct declarations matching the query.
-     * Matches patterns like: class ENGINE_API AActor : public UObject { ...
-     * Skips forward declarations (class AActor;).
+     * Search one header for a class/struct declaration matching the query.
+     * Matches `class ENGINE_API AActor : public UObject {`, `class UWorld final : ...`, `struct CORE_API FJsonValue {`
+     * and skips forward declarations (`class AActor;`).
      */
     private fun searchFileForDeclaration(
         file: VirtualFile,
@@ -435,123 +366,106 @@ class RiderLspWorkspaceService(
         symbols: MutableList<SymbolInformation>,
         seen: MutableSet<String>
     ) {
-        val document = FileDocumentManager.getInstance().getDocument(file) ?: return
-        val text = document.text
+        if (!file.isValid || file.isDirectory || file.length > MAX_HEADER_BYTES) return
+        val text = LspTranslator.fileText(file) ?: return
         val uri = LspTranslator.virtualFileToUri(file)
 
-        // Match: class/struct [alignment] [API_MACRO] ClassName [final] followed by : or { (not ;)
-        // This skips forward declarations like "class AActor;"
-        // Handles: class ENGINE_API AActor : public UObject
-        //          class UWorld final : public UObject
-        //          struct CORE_API FJsonValue {
         val escapedQuery = Regex.escape(query)
         val pattern = Regex(
-            """(?:class|struct)\s+(?:alignas\([^)]*\)\s+)?(?:\w+_API\s+)?$escapedQuery\s+(?:final\s+)?(?:[:{])""",
+            """(?:class|struct)\s+(?:alignas\([^)]*\)\s+)?(?:\w+_API\s+)?$escapedQuery\s*(?:final\s*)?[:{]""",
             RegexOption.MULTILINE
         )
 
         for (match in pattern.findAll(text)) {
             if (symbols.size >= maxResults) break
-            val nameIdx = text.indexOf(query, match.range.first)
+            val nameIdx = StringUtil.indexOf(text, query, match.range.first)
             if (nameIdx >= 0) {
-                val line = document.getLineNumber(nameIdx)
-                val lineStart = document.getLineStartOffset(line)
-                val col = nameIdx - lineStart
-                val pos = Position(line, col)
-                val loc = Location(uri, Range(pos, pos))
-                val key = "$query@$uri:$line"
+                val pos = LspTranslator.offsetToPosition(text, nameIdx)
+                val key = "$query@$uri:${pos.line}"
                 if (seen.add(key)) {
                     @Suppress("DEPRECATION")
-                    symbols.add(SymbolInformation(query, SymbolKind.Class, loc))
-                    log.info("    Found: $query at ${file.path}:${line + 1}")
+                    symbols.add(SymbolInformation(query, SymbolKind.Class, Location(uri, Range(pos, pos))))
                 }
             }
         }
     }
+
+    // ------------------------------------------------------------------------------------------
+    // NavigationItem -> SymbolInformation
+    // ------------------------------------------------------------------------------------------
 
     private fun extractLocationFromProtocolItem(item: NavigationItem): Location? {
         try {
             val itemClass = item.javaClass
-            // Extract file + line from ProtocolNavigationItem (FakePsiElement)
-
-            // Get the VirtualFile — try multiple approaches
             var vf: VirtualFile? = null
 
-            // Approach 1: containingVirtualFile field (most reliable for ProtocolNavigationItem)
+            // ProtocolNavigationItem.containingVirtualFile
             try {
                 val field = itemClass.getDeclaredField("containingVirtualFile")
                 field.isAccessible = true
                 vf = field.get(item) as? VirtualFile
-            } catch (_: Exception) {}
-
-            // Approach 2: getVirtualFile()
+            } catch (_: Exception) {
+            }
             if (vf == null) {
                 try {
-                    val vfMethod = itemClass.methods.find {
-                        it.name == "getVirtualFile" && it.parameterCount == 0
-                    }
+                    val vfMethod = itemClass.methods.firstOrNull { it.name == "getContainingVirtualFile" && it.parameterCount == 0 }
+                        ?: itemClass.methods.firstOrNull { it.name == "getVirtualFile" && it.parameterCount == 0 }
                     vf = vfMethod?.invoke(item) as? VirtualFile
-                } catch (_: Exception) {}
+                } catch (_: Exception) {
+                }
             }
-
-            // Approach 3: containingFile.virtualFile (PsiElement)
             if (vf == null) {
                 try {
                     vf = (item as? PsiElement)?.containingFile?.virtualFile
-                } catch (_: Exception) {}
+                } catch (_: Exception) {
+                }
             }
+            if (vf == null || !vf.isValid) return null
 
-            if (vf == null) return null
             val uri = LspTranslator.virtualFileToUri(vf)
+            var pos = Position(0, 0)
 
-            // Convert offset -> line/col
-            var line = 0
-            var col = 0
-            var startOffset = 0
-
-            // The ProtocolNavigationItem doesn't carry offset data from the backend.
-            // Resolve line number by searching for the symbol name in the file content.
+            // The backend item carries no offset; locate the short name in the file text.
             val itemName = item.name ?: ""
-            // Extract the short name for matching (e.g. "APlayerController" from "APlayerController::APlayerController(...)")
             val searchName = if ("::" in itemName) {
-                // For "Class::Method(...)", search for "Method" after the last "::"
-                val afterColons = itemName.substringAfterLast("::")
-                afterColons.substringBefore("(").trim().removePrefix("~")
+                itemName.substringAfterLast("::").substringBefore("(").trim().removePrefix("~")
             } else {
                 itemName.substringBefore("(").trim()
             }
 
-            if (searchName.isNotEmpty()) {
-                val document = FileDocumentManager.getInstance().getDocument(vf)
-                if (document != null) {
-                    val text = document.text
-                    // Search for the symbol name in the file
-                    val idx = text.indexOf(searchName)
-                    if (idx >= 0) {
-                        line = document.getLineNumber(idx)
-                        val lineStart = document.getLineStartOffset(line)
-                        col = idx - lineStart
-                    }
+            if (searchName.isNotEmpty() && vf.length <= MAX_HEADER_BYTES) {
+                val text = LspTranslator.fileText(vf)
+                if (text != null) {
+                    val idx = findWholeWord(text, searchName)
+                    if (idx >= 0) pos = LspTranslator.offsetToPosition(text, idx)
                 }
             }
 
-
-            if (startOffset > 0) {
-                val document = FileDocumentManager.getInstance().getDocument(vf)
-                if (document != null && startOffset <= document.textLength) {
-                    line = document.getLineNumber(startOffset)
-                    val lineStart = document.getLineStartOffset(line)
-                    col = startOffset - lineStart
-                }
-            }
-
-            val pos = Position(line, col)
             return Location(uri, Range(pos, pos))
         } catch (e: Exception) {
-            log.debug("  extractLocationFromProtocolItem failed: ${e.message}")
+            log.debug("extractLocationFromProtocolItem failed: ${e.message}")
             return null
         }
     }
+
+    /** First whole-word occurrence of [word] in [text]; falls back to a plain substring match. */
+    private fun findWholeWord(text: CharSequence, word: String): Int {
+        var from = 0
+        var fallback = -1
+        while (true) {
+            val idx = StringUtil.indexOf(text, word, from)
+            if (idx < 0) break
+            if (fallback < 0) fallback = idx
+            val before = if (idx > 0) text[idx - 1] else ' '
+            val afterIdx = idx + word.length
+            val after = if (afterIdx < text.length) text[afterIdx] else ' '
+            if (!isIdentifierChar(before) && !isIdentifierChar(after)) return idx
+            from = idx + 1
+        }
+        return fallback
+    }
+
+    private fun isIdentifierChar(c: Char) = c.isLetterOrDigit() || c == '_'
 
     private fun addNavigationItem(
         item: NavigationItem,
@@ -562,13 +476,12 @@ class RiderLspWorkspaceService(
         if (symbols.size >= maxResults) return
 
         val itemClassName = item.javaClass.name
-        // ProtocolNavigationItem extends FakePsiElement (which IS a PsiElement),
-        // but its textRange is (0,0). Check for protocol/fake items first.
+        // ProtocolNavigationItem extends FakePsiElement (a PsiElement) but its textRange is (0,0).
         val isFakeOrProtocol = itemClassName.contains("Protocol") ||
             itemClassName.contains("Fake") ||
             itemClassName.contains("RdDotnet")
         val psiElement = if (isFakeOrProtocol) null else item as? PsiElement
-        val loc = if (isFakeOrProtocol || psiElement == null) {
+        val loc = if (psiElement == null) {
             extractLocationFromProtocolItem(item)
         } else {
             LspTranslator.psiElementToLocation(psiElement)
@@ -577,7 +490,7 @@ class RiderLspWorkspaceService(
         val itemName = (item as? PsiNamedElement)?.name ?: item.name ?: fallbackName
 
         if (loc != null) {
-            val key = "${itemName}@${loc.uri}:${loc.range.start.line}"
+            val key = "$itemName@${loc.uri}:${loc.range.start.line}"
             if (!seen.add(key)) return
 
             val kind = if (psiElement is PsiNamedElement) {
@@ -589,11 +502,16 @@ class RiderLspWorkspaceService(
             @Suppress("DEPRECATION")
             symbols.add(SymbolInformation(itemName, kind, loc))
         } else {
-            log.debug("    Non-PSI item without location: ${item.javaClass.simpleName} '$itemName'")
+            log.debug("Item without location: ${item.javaClass.simpleName} '$itemName'")
         }
     }
 
     override fun didChangeConfiguration(params: DidChangeConfigurationParams) {}
 
     override fun didChangeWatchedFiles(params: DidChangeWatchedFilesParams) {}
+
+    private companion object {
+        const val MAX_HEADERS_TO_SCAN = 50
+        const val MAX_HEADER_BYTES = 4L * 1024 * 1024
+    }
 }

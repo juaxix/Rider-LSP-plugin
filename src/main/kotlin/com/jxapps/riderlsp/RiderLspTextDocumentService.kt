@@ -1,10 +1,11 @@
 // Copyright JxApps, Inc. All Rights Reserved.
 package com.jxapps.riderlsp
 
+import com.intellij.openapi.Disposable
+import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.ReadAction
 import com.intellij.openapi.diagnostic.Logger
-import com.intellij.openapi.editor.Document
-import com.intellij.openapi.fileEditor.FileDocumentManager
+import com.intellij.openapi.progress.ProcessCanceledException
 import com.intellij.openapi.project.DumbService
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.vfs.VirtualFile
@@ -12,19 +13,29 @@ import com.intellij.psi.*
 import com.intellij.psi.search.ProjectScope
 import com.intellij.psi.search.searches.ReferencesSearch
 import com.intellij.psi.util.PsiTreeUtil
+import com.intellij.util.Processor
 import org.eclipse.lsp4j.*
 import org.eclipse.lsp4j.jsonrpc.messages.Either
 import org.eclipse.lsp4j.services.TextDocumentService
+import java.util.concurrent.Callable
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
 class RiderLspTextDocumentService(
     private val project: Project,
-    private val server: RiderLspServer
+    private val expireWith: Disposable
 ) : TextDocumentService {
 
     private val log = Logger.getInstance(RiderLspTextDocumentService::class.java)
-    private val openDocuments = mutableMapOf<String, VirtualFile>()
+    private val openDocuments = ConcurrentHashMap<String, VirtualFile>()
+
+    /** Files the client has opened; used by the diagnostics publisher. */
+    fun trackedFiles(): Collection<VirtualFile> = openDocuments.values.toList()
+
+    fun dispose() {
+        openDocuments.clear()
+    }
 
     // --- Document tracking ---
 
@@ -32,19 +43,18 @@ class RiderLspTextDocumentService(
         val uri = params.textDocument.uri
         val file = LspTranslator.uriToVirtualFile(uri)
         if (file != null) {
-            synchronized(openDocuments) { openDocuments[uri] = file }
-            log.info("Opened: $uri")
+            openDocuments[uri] = file
+            log.debug("Opened: $uri")
         }
     }
 
     override fun didClose(params: DidCloseTextDocumentParams) {
-        val uri = params.textDocument.uri
-        synchronized(openDocuments) { openDocuments.remove(uri) }
-        log.info("Closed: $uri")
+        openDocuments.remove(params.textDocument.uri)
+        log.debug("Closed: ${params.textDocument.uri}")
     }
 
     override fun didChange(params: DidChangeTextDocumentParams) {
-        // Read-only server — changes are picked up through VFS
+        // Read-only server: changes are picked up through the VFS
     }
 
     override fun didSave(params: DidSaveTextDocumentParams) {
@@ -61,7 +71,7 @@ class RiderLspTextDocumentService(
             if (resolved != null) {
                 LspTranslator.psiElementToLocation(resolved)?.let { locations.add(it) }
             } else {
-                // Fallback: try navigation targets from the element itself
+                // Fallback: the element under the caret may itself be a declaration
                 val element = findElementAt(params.textDocument.uri, params.position)
                 val parent = element?.parent
                 if (parent is PsiNamedElement) {
@@ -77,8 +87,7 @@ class RiderLspTextDocumentService(
     override fun declaration(params: DeclarationParams): CompletableFuture<Either<List<Location>, List<LocationLink>>> {
         return computeInSmartMode("declaration") {
             val locations = mutableListOf<Location>()
-            val ref = findReferenceAt(params.textDocument.uri, params.position)
-            val resolved = ref?.resolve()
+            val resolved = findReferenceAt(params.textDocument.uri, params.position)?.resolve()
             if (resolved != null) {
                 LspTranslator.psiElementToLocation(resolved)?.let { locations.add(it) }
             }
@@ -91,17 +100,11 @@ class RiderLspTextDocumentService(
     override fun typeDefinition(params: TypeDefinitionParams): CompletableFuture<Either<List<Location>, List<LocationLink>>> {
         return computeInSmartMode("typeDefinition") {
             val locations = mutableListOf<Location>()
-
-            // Try to resolve reference first
             val ref = findReferenceAt(params.textDocument.uri, params.position)
             val element = ref?.resolve() ?: findElementAt(params.textDocument.uri, params.position)
-
             if (element != null) {
-                // For variables/fields, try to find their type
-                // For methods/functions, try to find return type's definition
                 LspTranslator.psiElementToLocation(element)?.let { locations.add(it) }
             }
-
             Either.forLeft(locations)
         }
     }
@@ -111,8 +114,7 @@ class RiderLspTextDocumentService(
     override fun implementation(params: ImplementationParams): CompletableFuture<Either<List<Location>, List<LocationLink>>> {
         return computeInSmartMode("implementation") {
             val locations = mutableListOf<Location>()
-            val ref = findReferenceAt(params.textDocument.uri, params.position)
-            val resolved = ref?.resolve()
+            val resolved = findReferenceAt(params.textDocument.uri, params.position)?.resolve()
             if (resolved != null) {
                 LspTranslator.psiElementToLocation(resolved)?.let { locations.add(it) }
             }
@@ -125,15 +127,15 @@ class RiderLspTextDocumentService(
     override fun references(params: ReferenceParams): CompletableFuture<List<Location>> {
         return computeInSmartMode("references") {
             val locations = mutableListOf<Location>()
-            val element = resolveElementAt(params.textDocument.uri, params.position) ?: return@computeInSmartMode locations
+            val element = resolveElementAt(params.textDocument.uri, params.position)
+                ?: return@computeInSmartMode locations
 
             val scope = ProjectScope.getProjectScope(project)
-            val refs = ReferencesSearch.search(element, scope).findAll()
-            for (ref in refs) {
-                val refElement = ref.element
-                LspTranslator.psiElementToLocation(refElement)?.let { locations.add(it) }
-                if (locations.size >= 200) break
-            }
+            // Stream results and stop early instead of materialising every reference first.
+            ReferencesSearch.search(element, scope).forEach(Processor { ref ->
+                LspTranslator.psiElementToLocation(ref.element)?.let { locations.add(it) }
+                locations.size < MAX_REFERENCES
+            })
             locations
         }
     }
@@ -143,12 +145,10 @@ class RiderLspTextDocumentService(
     override fun hover(params: HoverParams): CompletableFuture<Hover> {
         return computeInSmartMode("hover") {
             val element = findElementAt(params.textDocument.uri, params.position)
-            val named = PsiTreeUtil.getParentOfType(element, PsiNamedElement::class.java)
+            val named = PsiTreeUtil.getParentOfType(element, PsiNamedElement::class.java, false)
 
             if (named != null) {
                 val docComment = findDocComment(named)
-
-                // Better signature extraction
                 val signature = extractSignature(named)
 
                 val markdown = buildString {
@@ -168,24 +168,18 @@ class RiderLspTextDocumentService(
         }
     }
 
+    /** First line of the element's text, without materialising the whole element text. */
     private fun extractSignature(element: PsiNamedElement): String {
         return try {
-            // For better signature extraction, get the element's name and context
-            val name = element.name ?: "unknown"
-
-            // Try to build a meaningful signature
-            val text = element.text ?: ""
-            val lines = text.lines()
-
-            // Find the line with the actual signature (often first non-comment line)
-            var signature = if (lines.isNotEmpty()) lines[0] else text
-
-            // Limit length to avoid excessive output
-            if (signature.length > 200) {
-                signature = signature.substring(0, 200) + "..."
-            }
-
-            signature
+            val psiFile = element.containingFile ?: return element.name ?: "unknown"
+            val text = LspTranslator.psiFileText(psiFile)
+            val range = element.textRange ?: return element.name ?: "unknown"
+            val start = range.startOffset.coerceIn(0, text.length)
+            var end = start
+            val limit = minOf(range.endOffset, start + MAX_SIGNATURE_LENGTH, text.length)
+            while (end < limit && text[end] != '\n' && text[end] != '\r') end++
+            val signature = text.subSequence(start, end).toString()
+            if (end < range.endOffset && end - start >= MAX_SIGNATURE_LENGTH) "$signature..." else signature
         } catch (e: Exception) {
             element.name ?: "unknown"
         }
@@ -196,42 +190,48 @@ class RiderLspTextDocumentService(
     override fun documentSymbol(params: DocumentSymbolParams): CompletableFuture<List<Either<SymbolInformation, DocumentSymbol>>> {
         return computeInSmartMode("documentSymbol") {
             val result = mutableListOf<Either<SymbolInformation, DocumentSymbol>>()
-            val file = LspTranslator.uriToVirtualFile(params.textDocument.uri) ?: return@computeInSmartMode result
-            val psiFile = PsiManager.getInstance(project).findFile(file) ?: return@computeInSmartMode result
-            val document = FileDocumentManager.getInstance().getDocument(file) ?: return@computeInSmartMode result
+            val psiFile = getPsiFile(params.textDocument.uri) ?: return@computeInSmartMode result
+            val text = LspTranslator.psiFileText(psiFile)
 
             psiFile.accept(object : PsiRecursiveElementVisitor() {
                 override fun visitElement(element: PsiElement) {
-                    if (element is PsiNamedElement && element.name != null) {
-                        val name = element.name ?: return
-                        val kind = LspTranslator.psiElementToSymbolKind(element)
-                        val range = LspTranslator.textRangeToRange(document, element.textRange)
-                        val nameRange = if (element is PsiNameIdentifierOwner) {
-                            element.nameIdentifier?.let {
-                                LspTranslator.textRangeToRange(document, it.textRange)
+                    if (result.size >= MAX_DOCUMENT_SYMBOLS) return
+                    if (element is PsiNamedElement) {
+                        val name = element.name
+                        if (!name.isNullOrEmpty()) {
+                            val kind = LspTranslator.psiElementToSymbolKind(element)
+                            val range = LspTranslator.textRangeToRange(text, element.textRange)
+                            val nameRange = (element as? PsiNameIdentifierOwner)?.nameIdentifier?.let {
+                                LspTranslator.textRangeToRange(text, it.textRange)
                             } ?: range
-                        } else {
-                            range
+                            result.add(Either.forRight(DocumentSymbol(name, kind, range, nameRange)))
                         }
-
-                        val symbol = DocumentSymbol(name, kind, range, nameRange)
-                        result.add(Either.forRight(symbol))
                     }
                     super.visitElement(element)
                 }
             })
 
-            result.take(500)
+            result
         }
     }
 
     // --- Completion ---
 
     override fun completion(params: CompletionParams): CompletableFuture<Either<List<CompletionItem>, CompletionList>> {
-        return computeInSmartMode("completion") {
-            val items = CompletionBridge.getCompletions(project, params.textDocument.uri, params.position)
-            Either.forRight(CompletionList(false, items))
+        val future = CompletableFuture<Either<List<CompletionItem>, CompletionList>>()
+        // Completion needs the EDT (it creates a temporary editor). It must not be entered while this
+        // thread holds a read action, otherwise invokeAndWait can deadlock against a pending write action.
+        ApplicationManager.getApplication().executeOnPooledThread {
+            try {
+                DumbService.getInstance(project).waitForSmartMode()
+                val items = CompletionBridge.getCompletions(project, params.textDocument.uri, params.position)
+                future.complete(Either.forRight(CompletionList(false, items)))
+            } catch (e: Throwable) {
+                log.warn("Error in completion", e)
+                future.completeExceptionally(e)
+            }
         }
+        return future.orTimeout(REQUEST_TIMEOUT_SECONDS, TimeUnit.SECONDS)
     }
 
     override fun resolveCompletionItem(unresolved: CompletionItem): CompletableFuture<CompletionItem> {
@@ -240,22 +240,20 @@ class RiderLspTextDocumentService(
 
     // --- Helpers ---
 
-    private fun getDocumentAndPsiFile(uri: String): Pair<Document, PsiFile>? {
+    private fun getPsiFile(uri: String): PsiFile? {
         val file = LspTranslator.uriToVirtualFile(uri) ?: return null
-        val document = FileDocumentManager.getInstance().getDocument(file) ?: return null
-        val psiFile = PsiManager.getInstance(project).findFile(file) ?: return null
-        return document to psiFile
+        return PsiManager.getInstance(project).findFile(file)
     }
 
     private fun findElementAt(uri: String, position: Position): PsiElement? {
-        val (document, psiFile) = getDocumentAndPsiFile(uri) ?: return null
-        val offset = LspTranslator.positionToOffset(document, position)
+        val psiFile = getPsiFile(uri) ?: return null
+        val offset = LspTranslator.positionToOffset(LspTranslator.psiFileText(psiFile), position)
         return psiFile.findElementAt(offset)
     }
 
     private fun findReferenceAt(uri: String, position: Position): PsiReference? {
-        val (document, psiFile) = getDocumentAndPsiFile(uri) ?: return null
-        val offset = LspTranslator.positionToOffset(document, position)
+        val psiFile = getPsiFile(uri) ?: return null
+        val offset = LspTranslator.positionToOffset(LspTranslator.psiFileText(psiFile), position)
         return psiFile.findReferenceAt(offset)
     }
 
@@ -264,11 +262,10 @@ class RiderLspTextDocumentService(
         if (ref != null) return ref.resolve()
 
         val element = findElementAt(uri, position)
-        return PsiTreeUtil.getParentOfType(element, PsiNamedElement::class.java)
+        return PsiTreeUtil.getParentOfType(element, PsiNamedElement::class.java, false)
     }
 
     private fun findDocComment(element: PsiElement): String {
-        // Look for doc comments preceding the element
         var prev = element.prevSibling
         while (prev != null && prev is PsiWhiteSpace) {
             prev = prev.prevSibling
@@ -281,17 +278,26 @@ class RiderLspTextDocumentService(
 
     private fun <T> computeInSmartMode(label: String, action: () -> T): CompletableFuture<T> {
         val future = CompletableFuture<T>()
-
-        DumbService.getInstance(project).runReadActionInSmartMode {
-            try {
-                val result = ReadAction.compute<T, Throwable> { action() }
-                future.complete(result)
-            } catch (e: Exception) {
-                log.warn("Error in $label", e)
-                future.completeExceptionally(e)
-            }
+        try {
+            // Blocks the lsp4j message thread until indexing is done, then runs [action] inside a read action.
+            val result = ReadAction.nonBlocking(Callable { action() })
+                .inSmartMode(project)
+                .expireWith(expireWith)
+                .executeSynchronously()
+            future.complete(result)
+        } catch (e: ProcessCanceledException) {
+            future.completeExceptionally(e)
+        } catch (e: Throwable) {
+            log.warn("Error in $label", e)
+            future.completeExceptionally(e)
         }
+        return future.orTimeout(REQUEST_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+    }
 
-        return future.orTimeout(30, TimeUnit.SECONDS)
+    private companion object {
+        const val REQUEST_TIMEOUT_SECONDS = 30L
+        const val MAX_REFERENCES = 200
+        const val MAX_DOCUMENT_SYMBOLS = 500
+        const val MAX_SIGNATURE_LENGTH = 200
     }
 }

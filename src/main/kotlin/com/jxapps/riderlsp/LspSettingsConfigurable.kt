@@ -2,7 +2,16 @@
 package com.jxapps.riderlsp
 
 import com.intellij.openapi.options.Configurable
-import javax.swing.*
+import com.intellij.openapi.options.ConfigurationException
+import com.intellij.openapi.project.ProjectManager
+import javax.swing.BorderFactory
+import javax.swing.Box
+import javax.swing.BoxLayout
+import javax.swing.JCheckBox
+import javax.swing.JComponent
+import javax.swing.JLabel
+import javax.swing.JPanel
+import javax.swing.JTextField
 
 class LspSettingsConfigurable : Configurable {
 
@@ -43,7 +52,7 @@ class LspSettingsConfigurable : Configurable {
             })
             add(Box.createVerticalStrut(10))
 
-            add(JLabel("<html><i>Changes take effect after restarting the IDE.</i></html>"))
+            add(JLabel("<html><i>Changes are applied to all open projects immediately.</i></html>"))
             add(Box.createVerticalGlue())
         }
 
@@ -53,62 +62,40 @@ class LspSettingsConfigurable : Configurable {
     override fun isModified(): Boolean {
         val settings = LspSettings.getInstance()
         return enabledCheckbox?.isSelected != settings.enabled ||
-            portField?.text?.toIntOrNull() != settings.port ||
-            bindField?.text != settings.bindAddress
+            portField?.text?.trim()?.toIntOrNull() != settings.port ||
+            bindField?.text?.trim() != settings.bindAddress
     }
 
+    @Throws(ConfigurationException::class)
     override fun apply() {
         val portText = portField?.text?.trim() ?: "9999"
         val port = portText.toIntOrNull()
-
-        // Validate port range
         if (port == null || port !in 1..65535) {
-            JOptionPane.showMessageDialog(
-                panel,
-                "Invalid port: '$portText'. Port must be a number between 1 and 65535.",
-                "Invalid Port",
-                JOptionPane.ERROR_MESSAGE
-            )
-            return
+            throw ConfigurationException("Invalid port '$portText'. Port must be a number between 1 and 65535.")
         }
 
-        // Validate bind address (basic check)
         val bindAddress = bindField?.text?.trim() ?: "127.0.0.1"
         if (bindAddress.isBlank()) {
-            JOptionPane.showMessageDialog(
-                panel,
-                "Bind address cannot be empty.",
-                "Invalid Bind Address",
-                JOptionPane.ERROR_MESSAGE
-            )
-            return
+            throw ConfigurationException("Bind address cannot be empty.")
         }
-
-        // Try to parse bind address as IP or hostname
         try {
             java.net.InetAddress.getByName(bindAddress)
         } catch (e: Exception) {
-            JOptionPane.showMessageDialog(
-                panel,
-                "Invalid bind address: '$bindAddress'. Must be a valid IP address or hostname.",
-                "Invalid Bind Address",
-                JOptionPane.ERROR_MESSAGE
-            )
-            return
+            throw ConfigurationException("Invalid bind address '$bindAddress'. Must be a valid IP address or hostname.")
         }
 
-        // All validation passed, apply settings
         val settings = LspSettings.getInstance()
-        settings.enabled = enabledCheckbox?.isSelected ?: true
+        val enabled = enabledCheckbox?.isSelected ?: true
+        settings.enabled = enabled
         settings.port = port
         settings.bindAddress = bindAddress
 
-        JOptionPane.showMessageDialog(
-            panel,
-            "Settings saved. IDE restart required for changes to take effect.",
-            "Settings Applied",
-            JOptionPane.INFORMATION_MESSAGE
-        )
+        // Apply to running servers without an IDE restart.
+        for (project in ProjectManager.getInstance().openProjects) {
+            if (project.isDisposed) continue
+            val manager = LspServerManager.getInstance(project)
+            if (enabled) manager.restart() else manager.stop()
+        }
     }
 
     override fun reset() {
